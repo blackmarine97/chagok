@@ -1,0 +1,14 @@
+# Gradle / Kotlin
+.gradle/
+build/
+.kotlin/
+# IDE
+.idea/
+*.iml
+.vscode/
+# Android (app 모듈이 생기면)
+local.properties
+*.keystore
+# OS
+.DS_Store
+Thumbs.db
