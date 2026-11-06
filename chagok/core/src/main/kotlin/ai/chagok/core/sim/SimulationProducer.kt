@@ -31,6 +31,7 @@ class SimulationProducer(
     override fun start(scope: CoroutineScope, bus: SignalBus) {
         _status.value = Source.entries.associateWith { SourceStatus.AVAILABLE }
         job = scope.launch {
+            bus.awaitSubscriber()   // Engine이 아직 구독 전이면 리플레이가 통째로 버려진다
             var prev = 0L
             for (e in events) {
                 if (realtime) { val wait = (e.tsMonoNs - baseTsNs) / Ns.MS - prev; if (wait > 0) delay(wait); prev = (e.tsMonoNs - baseTsNs) / Ns.MS }
@@ -39,19 +40,22 @@ class SimulationProducer(
         }
     }
 
-    override fun stop() { job?.cancel() }
+    override fun stop() { job?.cancel(); _status.value = Source.entries.associateWith { SourceStatus.NOT_STARTED } }
 
     private fun parse(line: String): SignalEvent? {
         val t = line.trim(); if (t.isEmpty() || t.startsWith("#")) return null
         val p = t.split(",").map { it.trim() }
-        val ts = baseTsNs + p[0].toLong() * Ns.MS
-        return when (p[1]) {
-            "brake" -> SignalEvent(Source.BRAKE, SignalValue.BrakePedal(p[2] == "1" || p[2].equals("true", true)), ts)
-            "steer" -> SignalEvent(Source.STEERING, SignalValue.SteeringAngle(p[2].toDouble()), ts)
-            "odo" -> SignalEvent(Source.ODOMETER, SignalValue.Odometer(p[2].toDouble(), p.getOrNull(3)?.toLong() ?: 0L), ts)
-            "navi" -> SignalEvent(Source.NAVI, SignalValue.Navi(NaviGuidance.valueOf(p[2])), ts)
-            else -> null
-        }
+        if (p.size < 3) return null   // 깨진 줄은 리플레이를 멈추지 않고 건너뛴다
+        val ts = baseTsNs + (p[0].toLongOrNull() ?: return null) * Ns.MS
+        return runCatching {
+            when (p[1]) {
+                "brake" -> SignalEvent(Source.BRAKE, SignalValue.BrakePedal(p[2] == "1" || p[2].equals("true", true)), ts)
+                "steer" -> SignalEvent(Source.STEERING, SignalValue.SteeringAngle(p[2].toDouble()), ts)
+                "odo" -> SignalEvent(Source.ODOMETER, SignalValue.Odometer(p[2].toDouble(), p.getOrNull(3)?.toLongOrNull() ?: 0L), ts)
+                "navi" -> SignalEvent(Source.NAVI, SignalValue.Navi(NaviGuidance.valueOf(p[2])), ts)
+                else -> null
+            }
+        }.getOrNull()
     }
 
     companion object {

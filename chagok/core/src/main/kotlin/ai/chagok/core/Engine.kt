@@ -3,6 +3,7 @@ package ai.chagok.core
 import ai.chagok.core.alert.AlertCandidate
 import ai.chagok.core.alert.AlertGate
 import ai.chagok.core.alert.Decision
+import ai.chagok.core.alert.DenyReason
 import ai.chagok.core.buffer.Capture
 import ai.chagok.core.buffer.CaptureService
 import ai.chagok.core.derive.DerivedState
@@ -14,6 +15,7 @@ import ai.chagok.core.match.ConditionMatcher
 import ai.chagok.core.match.MatchResult
 import ai.chagok.core.model.AlertAdjustment
 import ai.chagok.core.model.Command
+import ai.chagok.core.model.Ns
 import ai.chagok.core.model.Observation
 import ai.chagok.core.model.SignalEvent
 import ai.chagok.core.model.Source
@@ -33,17 +35,22 @@ import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import java.util.UUID
+import kotlin.math.abs
 
 /**
  * UI·TTS로 나가는 것들. 엔진은 이것만 내고, 화면·음성 출력은 바깥에서 한다.
  * 모두 "한 번 일어난 일"이라 손실되면 안 된다. 연속 상태(DerivedState)는 여기 없고 [Engine.state]로 따로 나간다.
  */
 sealed class EngineEvent {
-    data class Alert(val alertId: String, val issueId: String, val repairCheck: Boolean, val tsMonoNs: Long) : EngineEvent()
+    /** recordCount: "기록 N건과 같은 조건에 들어왔어요" 문구용. repairCheck: 수리 후 확인 중이면 "확인 조건을 지나고 있어요". */
+    data class Alert(val alertId: String, val issueId: String, val repairCheck: Boolean, val tsMonoNs: Long, val recordCount: Int) : EngineEvent()
     data class RecordCaptured(val record: SymptomRecord) : EngineEvent()
+    /** 기존 기록의 묘사·연결이 바뀌었다(새 기록이 아니다). */
+    data class RecordUpdated(val record: SymptomRecord) : EngineEvent()
     data class RecordFailed(val reason: String) : EngineEvent()
     data class ProfileChanged(val profile: ConditionProfile) : EngineEvent()
-    data class UserChoiceNeeded(val issueId: String) : EngineEvent()
+    /** 3회 연속 못 느낌. repairCheck=true면 "해결로 기록할까요", 아니면 "알림을 축소·중지할까요"로 물어야 한다. */
+    data class UserChoiceNeeded(val issueId: String, val repairCheck: Boolean) : EngineEvent()
     /** Issue 상태·읽음·해결이 바뀌었다. 목록 화면 갱신용. */
     data class IssueChanged(val issue: Issue) : EngineEvent()
     /** 탑승 브리핑. 정차 중 화면·음성으로 읽어 준다. */
@@ -72,6 +79,8 @@ class Engine(
     private val tripId: () -> String = { "trip" },
     private val newId: () -> String = { UUID.randomUUID().toString() },
     private val wallClockMs: () -> Long = System::currentTimeMillis,
+    /** "느꼈어요" 답변 때 알림 시점 ± 이 범위 안에 이미 기록이 있으면 새 기록을 만들지 않는다. */
+    private val sameMomentNs: Long = Ns.sec(30.0),
 ) {
     private val _events = Channel<EngineEvent>(Channel.UNLIMITED)
     val events: Flow<EngineEvent> = _events.receiveAsFlow()
@@ -80,9 +89,11 @@ class Engine(
     private val _sourceStatus = MutableStateFlow(Source.entries.associateWith { SourceStatus.NOT_STARTED })
     val sourceStatus: StateFlow<Map<Source, SourceStatus>> = _sourceStatus.asStateFlow()
 
+    private class OpenAlert(val issueId: String, val tsMonoNs: Long)
     private val pendingAuthors = HashMap<Long, String>()      // triggerTs → authorId
-    private val openAlerts = HashMap<String, String>()         // alertId → issueId (답을 아직 못 받은 알림)
+    private val openAlerts = LinkedHashMap<String, OpenAlert>() // alertId → 답을 아직 못 받은 알림
     private val producerStatus = HashMap<String, Map<Source, SourceStatus>>()   // producer name → 소스별 상태
+    private var job: Job? = null
 
     private sealed class In {
         data class Sig(val e: SignalEvent) : In()
@@ -90,16 +101,19 @@ class Engine(
         data class Status(val producer: String, val s: Map<Source, SourceStatus>) : In()
     }
 
-    /** producers를 넘기면 그 상태(권한 없음·미지원)도 같은 코루틴에서 받아 판정 불가로 반영한다. */
-    fun start(scope: CoroutineScope, signals: SignalBus, commands: CommandBus, producers: List<SignalProducer> = emptyList()): Job = scope.launch {
-        val statusFlows = producers.map { p -> p.status.map { In.Status(p.name, it) as In } }
-        merge(signals.events.map { In.Sig(it) as In }, commands.commands.map { In.Cmd(it) as In }, *statusFlows.toTypedArray()).collect { msg ->
-            when (msg) {
-                is In.Sig -> onSignal(msg.e)
-                is In.Cmd -> onCommand(msg.c)
-                is In.Status -> onProducerStatus(msg.producer, msg.s)
+    /** producers를 넘기면 그 상태(권한 없음·미지원)도 같은 코루틴에서 받아 판정 불가로 반영한다. 두 번 부르면 돌고 있는 Job을 돌려준다. */
+    fun start(scope: CoroutineScope, signals: SignalBus, commands: CommandBus, producers: List<SignalProducer> = emptyList()): Job {
+        job?.takeIf { it.isActive }?.let { return it }
+        return scope.launch {
+            val statusFlows = producers.map { p -> p.status.map { In.Status(p.name, it) as In } }
+            merge(signals.events.map { In.Sig(it) as In }, commands.commands.map { In.Cmd(it) as In }, *statusFlows.toTypedArray()).collect { msg ->
+                when (msg) {
+                    is In.Sig -> onSignal(msg.e)
+                    is In.Cmd -> onCommand(msg.c)
+                    is In.Status -> onProducerStatus(msg.producer, msg.s)
+                }
             }
-        }
+        }.also { job = it }
     }
 
     private fun emit(e: EngineEvent) { _events.trySend(e) }   // UNLIMITED라 항상 성공
@@ -114,14 +128,14 @@ class Engine(
 
     fun onCommand(c: Command) {
         when (c) {
-            is Command.Capture -> { pendingAuthors[c.tsMonoNs] = c.authorId; captures.capture(c.tsMonoNs) }
+            is Command.Capture -> { pendingAuthors[c.tsMonoNs] = c.authorId; captures.capture(c.tsMonoNs)?.let { finishCapture(it) } }   // 뒤 10초가 이미 있으면 즉시 완성
             is Command.CaptureAt -> {
                 val cap = captures.captureAt(c.tsMonoNs)
                 if (cap == null) emit(EngineEvent.RecordFailed("temp buffer no longer covers that time"))
                 else saveRecord(cap, c.authorId)
             }
             is Command.LinkRecord -> linkRecord(c)
-            is Command.Describe -> repo.record(c.recordId)?.let { r -> val nr = r.copy(description = c.text); repo.saveRecord(nr); emit(EngineEvent.RecordCaptured(nr)) }
+            is Command.Describe -> repo.record(c.recordId)?.let { r -> val nr = r.copy(description = c.text); repo.saveRecord(nr); emit(EngineEvent.RecordUpdated(nr)) }
             is Command.ArmAlert -> repo.profile(c.issueId)?.let { p -> val np = p.copy(armedByUser = c.on); repo.saveProfile(np); emit(EngineEvent.ProfileChanged(np)) }
             is Command.Answer -> answer(c)
             is Command.AdjustAlert -> adjust(c)
@@ -132,7 +146,7 @@ class Engine(
             is Command.ResolveIssue -> resolve(c)
             is Command.ReopenIssue -> reopen(c.issueId)
             is Command.EndDrive -> endDrive(c.tsMonoNs)
-            is Command.DiscardTemp -> { captures.discardTemp(); pendingAuthors.clear() }
+            is Command.DiscardTemp -> { captures.discardTemp().forEach { finishCapture(it) }; pendingAuthors.clear() }   // 고정된 기록은 마감해 저장, 임시 버퍼만 폐기
         }
     }
 
@@ -176,13 +190,14 @@ class Engine(
         saveRecord(cap, author)
     }
 
-    private fun saveRecord(cap: Capture, author: String) {
+    private fun saveRecord(cap: Capture, author: String, issueId: String? = null): SymptomRecord {
         val r = SymptomRecord(
-            id = newId(), issueId = null, authorId = author, tripId = tripId(), capture = cap,
+            id = newId(), issueId = issueId, authorId = author, tripId = tripId(), capture = cap,
             features = FeatureExtractor.extract(cap), recordedAtEpochMs = wallClockMs(),
         )
         repo.saveRecord(r)
         emit(EngineEvent.RecordCaptured(r))
+        return r
     }
 
     private fun linkRecord(c: Command.LinkRecord) {
@@ -193,6 +208,9 @@ class Engine(
                 .also { repo.saveIssue(it); emit(EngineEvent.IssueChanged(it)) }
         }
         repo.saveRecord(r.copy(issueId = issue.id))
+        emit(EngineEvent.RecordUpdated(repo.record(r.id)!!))
+        // 다른 문제에 붙어 있던 기록을 옮겼으면 그쪽 프로파일도 다시 계산한다(기록이 빠졌으니 상태가 내려갈 수 있다)
+        r.issueId?.takeIf { it != issue.id }?.let { rebuildProfile(it) }
         // 해결된 문제에 새 기록이 붙으면 재발
         if (issue.status == IssueStatus.RESOLVED) reopen(issue.id) else rebuildProfile(issue.id)
     }
@@ -217,24 +235,48 @@ class Engine(
             if (m !is MatchResult.Match) continue
             val cand = AlertCandidate(p.issueId, s.tsMonoNs, m.naviChecked, repairCheck = issue.status == IssueStatus.IN_REPAIR_CHECK)
             when (val d = gate.decide(cand, p)) {
-                is Decision.Allow -> { openAlerts[d.alertId] = p.issueId; emit(EngineEvent.Alert(d.alertId, p.issueId, cand.repairCheck, s.tsMonoNs)) }
-                is Decision.Deny -> Unit
+                is Decision.Allow -> {
+                    openAlerts[d.alertId] = OpenAlert(p.issueId, s.tsMonoNs)
+                    emit(EngineEvent.Alert(d.alertId, p.issueId, cand.repairCheck, s.tsMonoNs, p.recordCount))
+                    return
+                }
+                is Decision.Deny -> when (d.reason) {
+                    // 이 문제가 방금 울렸거나 오늘 다 울렸다: 같은 조건에 뒤 문제가 번갈아 울리지 않게 여기서 멈춘다
+                    DenyReason.COOLDOWN, DenyReason.DAILY_CAP -> return
+                    // 주행 규제는 모든 문제에 같다
+                    DenyReason.DRIVING -> return
+                    // 이 문제는 지금 울릴 수 없는 상태(선택 대기·중지)다. 뒤 문제를 영원히 가리면 안 되니 넘어간다
+                    DenyReason.PROFILE, DenyReason.USER_CHOICE -> continue
+                }
             }
-            return
         }
     }
 
+    /**
+     * 정차 후 답변. 열린 알림에만 답할 수 있다(모르는 알림 id, 이미 EndDrive가 미확인으로 센 알림은 무시 → 이중 집계 방지).
+     * "느꼈어요"는 재현 성공이므로 기획서대로 기록을 같은 문제에 연결한다: 알림 시점 근처에 이미 기록이 없으면
+     * 임시 버퍼에서 알림 시점의 30초를 잘라 기록으로 만들고 연결한다. 버퍼가 그 시점을 덮지 못하면 카운트만 올린다.
+     */
     private fun answer(c: Command.Answer) {
-        openAlerts.remove(c.alertId)
-        applyObservation(c.issueId, c.answer)
+        val open = openAlerts.remove(c.alertId) ?: return
+        if (c.answer == Observation.FELT && !hasRecordNear(open.issueId, open.tsMonoNs)) {
+            captures.captureAt(open.tsMonoNs)?.let { cap ->
+                saveRecord(cap, c.memberId ?: "unknown", issueId = open.issueId)
+                rebuildProfile(open.issueId)
+            }
+        }
+        applyObservation(open.issueId, c.answer)
     }
+
+    private fun hasRecordNear(issueId: String, tsMonoNs: Long) =
+        repo.records().any { it.issueId == issueId && abs(it.capture.triggerTsNs - tsMonoNs) <= sameMomentNs }
 
     private fun applyObservation(issueId: String, o: Observation) {
         val p = repo.profile(issueId) ?: return
         val np = p.copy(counts = p.counts.apply(o))
         repo.saveProfile(np)
         emit(EngineEvent.ProfileChanged(np))
-        if (np.needsUserChoice) emit(EngineEvent.UserChoiceNeeded(np.issueId))
+        if (np.needsUserChoice) emit(EngineEvent.UserChoiceNeeded(np.issueId, repairCheck = repo.issue(issueId)?.status == IssueStatus.IN_REPAIR_CHECK))
     }
 
     private fun adjust(c: Command.AdjustAlert) {
@@ -243,6 +285,8 @@ class Engine(
             AlertAdjustment.KEEP -> p.copy(counts = p.counts.copy(consecutiveNotFelt = 0))
             AlertAdjustment.REDUCE -> p.copy(state = ProfileState.REDUCED, counts = p.counts.copy(consecutiveNotFelt = 0))
             AlertAdjustment.STOP -> p.copy(state = ProfileState.STOPPED)
+            // 중지·축소를 풀고 기록 수로 상태를 다시 계산한다(열려 있는 문제에서 알림을 되살리는 유일한 길)
+            AlertAdjustment.RESUME -> { rebuildProfile(c.issueId, p.copy(state = ProfileState.NONE, counts = p.counts.copy(consecutiveNotFelt = 0))); return }
         }
         repo.saveProfile(np); emit(EngineEvent.ProfileChanged(np))
     }
@@ -285,20 +329,24 @@ class Engine(
         ))
     }
 
-    /** 해결: Issue RESOLVED, 알림 중지(프로파일 STOPPED), 전달 대상은 Board 때 BriefingBuilder가 정한다. */
+    /** 해결: Issue RESOLVED, 알림 중지(프로파일 STOPPED), 관리 이력에 한 줄, 전달 대상은 Board 때 BriefingBuilder가 정한다. */
     private fun resolve(c: Command.ResolveIssue) {
         val i = repo.issue(c.issueId) ?: return
         if (!i.isOpen) return
         saveIssue(i.copy(status = IssueStatus.RESOLVED, resolution = Resolution(c.memberId, c.note, wallClockMs()), readBy = i.readBy + c.memberId))
+        logMaintenance(c.issueId, "해결: ${c.note ?: "사용자가 해결로 기록"}", c.memberId, fromVehicle = false)
         repo.profile(c.issueId)?.let { p -> val np = p.copy(state = ProfileState.STOPPED); repo.saveProfile(np); emit(EngineEvent.ProfileChanged(np)) }
-        openAlerts.entries.removeIf { it.value == c.issueId }
+        openAlerts.entries.removeIf { it.value.issueId == c.issueId }
     }
 
-    /** 재발: 다시 열고(REOPENED), 프로파일은 기록 수로 상태를 다시 계산한다. 카운트 이력은 남기고 연속 못 느낌만 초기화. */
+    /**
+     * 재발: 다시 열고(REOPENED), 읽음을 비워 모두에게 다시 새 소식으로 보이게 하고,
+     * 프로파일은 기록 수로 상태를 다시 계산한다. 카운트 이력은 남기고 연속 못 느낌만 초기화.
+     */
     private fun reopen(issueId: String) {
         val i = repo.issue(issueId) ?: return
         if (i.status != IssueStatus.RESOLVED) return
-        saveIssue(i.copy(status = IssueStatus.REOPENED, resolution = null))
+        saveIssue(i.copy(status = IssueStatus.REOPENED, resolution = null, readBy = emptySet()))
         val prev = repo.profile(issueId)?.let { it.copy(state = ProfileState.NONE, counts = it.counts.copy(consecutiveNotFelt = 0)) }
         rebuildProfile(issueId, prev)
     }
@@ -308,7 +356,8 @@ class Engine(
     /** 주행 종료: 미완성 Capture는 지금까지로 저장, 답 없는 알림은 미확인(기획서: 답이 없으면 미확인으로 두고 어느 쪽으로도 세지 않음). */
     private fun endDrive(nowTs: Long) {
         captures.flush(nowTs).forEach { finishCapture(it) }
-        val unanswered = openAlerts.values.toList(); openAlerts.clear()
+        deriver.reset()   // 이전 주행의 브레이크·공백 상태를 다음 주행으로 끌고 가지 않는다
+        val unanswered = openAlerts.values.map { it.issueId }; openAlerts.clear()
         unanswered.forEach { applyObservation(it, Observation.UNKNOWN) }
     }
 

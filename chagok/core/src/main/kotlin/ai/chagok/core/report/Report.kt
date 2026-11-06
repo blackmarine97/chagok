@@ -20,8 +20,13 @@ data class Report(
     val counts: Counts,
     val maintenance: List<MaintenanceEntry>,
 ) {
-    /** "회전 무관"의 근거: 기록된 조향 범위가 기본 필터(|조향| ≤ 10°) 안이면 완만한 구간에서만 났다는 뜻. */
-    val steeringSummary: String get() = profile?.steering?.let { "조향 ${fmt(it.min)}°~${fmt(it.max)}°" } ?: "조향 기록 없음"
+    /** "회전 무관"의 근거: 실제 기록된 조향각의 범위(허용 오차 없이). 기본 필터(|조향| ≤ 10°) 안이면 완만한 구간에서만 났다는 뜻. */
+    val steeringSummary: String get() {
+        val v = observations.mapNotNull { it.steeringDeg }
+        if (v.isEmpty()) return "조향 기록 없음"
+        val lo = v.min(); val hi = v.max()
+        return if (lo == hi) "조향 ${fmt(lo)}°" else "조향 ${fmt(lo)}°~${fmt(hi)}°"
+    }
 }
 
 /** 기록 1건 = 표 한 줄. 차량 수신 값과 사용자 입력(묘사)을 한 줄에 두되 출처를 열마다 표시한다. */
@@ -58,7 +63,7 @@ object ReportBuilder {
         appendLine("문제: ${r.issue.title} [${r.issue.status}]")
         appendLine("관측 ${r.observations.size}건 · 느낌 ${r.counts.felt} / 못 느낌 ${r.counts.notFelt} / 미확인 ${r.counts.unknown}")
         r.profile?.let { p ->
-            appendLine("조건: 브레이크 ${p.brakeHold?.let { "${fmt(it.min)}~${fmt(it.max)}초" } ?: "-"} · ${r.steeringSummary} · 내비 ${p.navi.joinToString("/").ifEmpty { "-" }}")
+            appendLine("관측 범위: ${r.steeringSummary} · 알림 조건(오차 포함): 브레이크 ${p.brakeHold?.let { "${fmt(it.min)}~${fmt(it.max)}초" } ?: "-"}, 조향 ${p.steering?.let { "${fmt(it.min)}°~${fmt(it.max)}°" } ?: "-"}, 내비 ${p.navi.joinToString("/").ifEmpty { "-" }}")
         }
         appendLine("기록 (차량 수신: 브레이크·조향·내비·주행거리 / 사용자 입력: 묘사)")
         for (o in r.observations) {

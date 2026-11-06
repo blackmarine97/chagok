@@ -32,7 +32,8 @@ class StateDeriverTest {
         d.onEvent(Fx.steer(0.0, 2.0)); d.onEvent(Fx.navi(0.0, NaviGuidance.STRAIGHT))
         val s = d.onEvent(Fx.brake(40.0, true))
         assertTrue(Source.STEERING in s.stale); assertNull(s.steeringDeg)
-        assertEquals(NaviGuidance.DATA_UNAVAILABLE, s.navi, "내비 stale이면 누락으로 본다")
+        assertEquals(NaviGuidance.STRAIGHT, s.navi, "내비 안내 유형은 변화 시점에만 오는 값이라 시간이 지나도 마지막 값을 유지한다(누락은 Producer 상태로)")
+        assertTrue(Source.NAVI !in s.stale)
     }
 
     @Test fun stoppedWhenOdometerUnchanged() {

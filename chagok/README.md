@@ -6,7 +6,7 @@ Gradle multi-module root for Chagok. The project overview, architecture, plan-to
 
 | Module | Status | Description |
 |---|---|---|
-| `core` | builds, 23 tests pass | Reproduction-alert engine. Pure Kotlin/JVM, no Pleos SDK dependency. The Android app consumes this module and only plugs in SDK adapters as `SignalProducer` implementations. |
+| `core` | builds, 87 tests pass | Reproduction-alert engine. Pure Kotlin/JVM, no Pleos SDK dependency. The Android app consumes this module and only plugs in SDK adapters as `SignalProducer` implementations. |
 | `app` | not started | Android Automotive app: Pleos Vehicle / NaviHelper adapters, Room repository, in-car UI and TTS. Requires the Android SDK and the Pleos SDK. |
 
 ## Build
@@ -33,5 +33,8 @@ core/src/main/kotlin/ai/chagok/core/
   sim/        SimulationProducer (offsetMs,source,value replay)
   Engine.kt   wiring: one coroutine, lossless events channel, state and sourceStatus flows
 core/src/test/kotlin/ai/chagok/core/
-  EngineScenarioTest, HandoverStoryTest, EnginePolicyTest, StateDeriverTest, CaptureServiceTest, MatcherAndGateTest, Fixtures
+  SmokeTest, EngineScenarioTest, HandoverStoryTest, EnginePolicyTest, EngineCommandTest,
+  PipelineUnitTest, BusAndSimTest, DomainTest, StateDeriverTest, CaptureServiceTest, MatcherAndGateTest, Fixtures
+core/src/test/resources/fixtures/
+  smoke_part1..3.csv   replay fixtures in SimulationProducer format (offsetMs,source,value)
 ```

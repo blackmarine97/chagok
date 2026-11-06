@@ -58,6 +58,7 @@ data class RecordFeatures(
     val steeringDeg: Double?,
     val navi: NaviGuidance,
     val odometerMeters: Double? = null,   // 기록 시점 누적 주행거리. 조건 비교에는 쓰지 않고 리포트 표시용
+    val brakeHoldCompleted: Boolean = false, // ON→OFF 완료값인지(true), 진행 중 하한인지(false). 리포트 표시용
 )
 
 /** 재현 조건의 상태. Issue 상태와 독립. */

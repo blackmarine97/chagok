@@ -15,8 +15,8 @@ sealed class Command {
     // ── 재현 알림 ──
     /** "다음에 알려줘" — 기록 1건 상태에서 알림을 켠다. */
     data class ArmAlert(val issueId: String, val on: Boolean) : Command()
-    /** 정차 후 답변. */
-    data class Answer(val issueId: String, val alertId: String, val answer: Observation) : Command()
+    /** 정차 후 답변. 열린 알림의 id로만 답할 수 있다. memberId는 답한 운전자("느꼈어요"로 만들어지는 기록의 작성자). */
+    data class Answer(val issueId: String, val alertId: String, val answer: Observation, val memberId: String? = null) : Command()
     /** 3회 연속 못 느꼈을 때 사용자의 선택. */
     data class AdjustAlert(val issueId: String, val choice: AlertAdjustment) : Command()
 
@@ -46,4 +46,5 @@ sealed class Command {
 }
 
 enum class Observation { FELT, NOT_FELT, UNKNOWN }
-enum class AlertAdjustment { KEEP, REDUCE, STOP }
+/** KEEP 유지 · REDUCE 축소(하루 1회) · STOP 중지 · RESUME 중지/축소를 풀고 기록 수로 상태를 다시 계산 */
+enum class AlertAdjustment { KEEP, REDUCE, STOP, RESUME }

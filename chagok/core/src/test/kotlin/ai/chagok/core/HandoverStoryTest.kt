@@ -57,6 +57,7 @@ class HandoverStoryTest {
         advanceUntilIdle()
         val rec1 = drain<EngineEvent.RecordCaptured>().single().record
         assertNotNull(rec1.features.odometerMeters, "리포트용 주행거리가 기록에 남는다")
+        assertEquals(2.5, rec1.features.brakeHoldSec!!, 1e-6, "발화 뒤 OFF까지 기다린 완료값(0.5초 격자라 2.4가 아니라 2.5)"); assertTrue(rec1.features.brakeHoldCompleted)
         engine.onCommand(Command.LinkRecord(rec1.id, null, "감속할 때 앞쪽 끼익 소리"))
         engine.onCommand(Command.Describe(rec1.id, "앞쪽에서 끼익"))
         advanceUntilIdle()
@@ -77,7 +78,7 @@ class HandoverStoryTest {
         // 장면 3 · 수요일 준호: 알림 켜고 같은 조건 → 알림 → 준호도 기록 → 같은 문제에 연결 → 잠정 패턴
         trip = "wed"; events.clear()
         engine.onCommand(Command.ArmAlert(issueId, true))
-        run(Fx.drive(1100.0, 6.5, brakeAt = 1105.0, brakeFor = 2.1, steer = 2.0, g = NaviGuidance.STRAIGHT))
+        run(Fx.drive(1100.0, 7.0, brakeAt = 1105.0, brakeFor = 2.1, steer = 2.0, g = NaviGuidance.STRAIGHT))   // 완료 유지 2.5초 기록 → 하한 2.0초 → 1107.0에 알림
         advanceUntilIdle()
         val alert1 = drain<EngineEvent.Alert>().single()
         assertTrue(!alert1.repairCheck, "수리 전 알림")
@@ -86,9 +87,11 @@ class HandoverStoryTest {
         advanceUntilIdle()
         val rec2 = drain<EngineEvent.RecordCaptured>().single().record
         engine.onCommand(Command.LinkRecord(rec2.id, issueId))
-        engine.onCommand(Command.Answer(issueId, alert1.alertId, Observation.FELT))
+        engine.onCommand(Command.Answer(issueId, alert1.alertId, Observation.FELT, "junho"))
         advanceUntilIdle()
-        assertEquals(ProfileState.PROVISIONAL, repo.profile(issueId)!!.state)
+        val p2 = repo.profile(issueId)!!
+        assertEquals(ProfileState.PROVISIONAL, p2.state); assertEquals(2, p2.distinctTrips)
+        assertEquals(2, p2.recordCount, "알림 시점에 이미 기록이 있으면 느꼈어요가 기록을 또 만들지 않는다"); assertEquals(1, p2.counts.felt)
 
         // 장면 4 · 정비 리포트: 기록 2건, 출처 구분(차량 수신 수치 / 사용자 입력 묘사), 정비 노트 없음
         val report1 = ReportBuilder.build(repo, issueId)!!
@@ -99,7 +102,8 @@ class HandoverStoryTest {
         assertEquals("앞쪽에서 끼익", report1.observations[0].description)
         assertNull(report1.observations[1].description)
         assertEquals(1, report1.counts.felt)
-        assertTrue(ReportBuilder.render(report1).contains("조향 -9°~8°"), ReportBuilder.render(report1))
+        assertEquals("조향 -3°~2°", report1.steeringSummary, "리포트의 관측 범위는 오차 없는 실제 기록값")
+        assertTrue(ReportBuilder.render(report1).contains("알림 조건(오차 포함): 브레이크 2~3초, 조향 -9°~8°"), ReportBuilder.render(report1))
 
         // 장면 5 · 준호가 정비 등록(패드 교체) → 수리 후 확인 모드. 같은 조건을 지나면 "확인 조건" 알림, 정차 후 못 느낌.
         events.clear()
@@ -107,11 +111,11 @@ class HandoverStoryTest {
         advanceUntilIdle()
         assertEquals(IssueStatus.IN_REPAIR_CHECK, repo.issue(issueId)!!.status)
         trip = "fri"
-        run(Fx.drive(2100.0, 10.0, brakeAt = 2105.0, brakeFor = 2.0, steer = 0.0, g = NaviGuidance.STRAIGHT))
+        run(Fx.drive(2100.0, 10.0, brakeAt = 2105.0, brakeFor = 2.5, steer = 0.0, g = NaviGuidance.STRAIGHT))
         advanceUntilIdle()
         val alert2 = drain<EngineEvent.Alert>().single()
         assertTrue(alert2.repairCheck, "수리 후 확인 알림은 문구가 다르다")
-        engine.onCommand(Command.Answer(issueId, alert2.alertId, Observation.NOT_FELT))
+        engine.onCommand(Command.Answer(issueId, alert2.alertId, Observation.NOT_FELT, "junho"))
         val b2 = briefingFor("minji")
         assertEquals(issueId, b2.inRepairCheck.single().issue.id, "확인 중 항목으로 따로 나온다")
         assertTrue(b2.unresolved.isEmpty())
@@ -126,7 +130,9 @@ class HandoverStoryTest {
         advanceUntilIdle()
         assertEquals(IssueStatus.RESOLVED, repo.issue(issueId)!!.status)
         assertEquals(ProfileState.STOPPED, repo.profile(issueId)!!.state)
-        run(Fx.drive(2200.0, 10.0, brakeAt = 2205.0, brakeFor = 2.0, steer = 0.0, g = NaviGuidance.STRAIGHT))
+        val history = ReportBuilder.build(repo, issueId)!!.maintenance
+        assertEquals(2, history.size); assertTrue(history.last().text.startsWith("해결: 패드 교체 후"), "해결은 관리 이력에 남는다")
+        run(Fx.drive(2200.0, 10.0, brakeAt = 2205.0, brakeFor = 2.5, steer = 0.0, g = NaviGuidance.STRAIGHT))
         advanceUntilIdle()
         assertTrue(drain<EngineEvent.Alert>().isEmpty(), "해결 후에는 알리지 않는다")
         val b3 = briefingFor("minji")
@@ -150,7 +156,8 @@ class HandoverStoryTest {
         assertEquals(ProfileState.PROVISIONAL, p.state); assertEquals(3, p.recordCount)
         assertEquals(1, p.counts.felt); assertEquals(1, p.counts.notFelt); assertEquals(0, p.counts.consecutiveNotFelt)
         assertNull(repo.issue(issueId)!!.resolution)
-        assertEquals(issueId, briefingFor("junho").unresolved.single().issue.id, "재발은 다시 미해결로 브리핑된다")
+        val reopened = briefingFor("junho").unresolved.single()
+        assertEquals(issueId, reopened.issue.id, "재발은 다시 미해결로 브리핑된다"); assertTrue(reopened.unread, "재발하면 읽음이 비워져 다시 새 소식으로 보인다")
 
         collector.cancel()
     }

@@ -36,6 +36,7 @@ class TimedRing(private val windowNs: Long, private val maxEvents: Int = 100_000
         return latest.values.sortedWith(compareBy({ it.tsMonoNs }, { it.seq }))
     }
     fun oldestTs(): Long? = buf.firstOrNull()?.tsMonoNs
+    fun newestTs(): Long? = buf.maxOfOrNull { it.tsMonoNs }
     fun clear() { buf.clear(); evicted.clear() }
 }
 
@@ -81,18 +82,29 @@ class CaptureService(
         return done
     }
 
-    /** 발화 시점에 호출. 앞 20초를 즉시 고정. 완성은 onEvent가 post 구간을 넘길 때. */
-    fun capture(triggerTs: Long) {
+    /**
+     * 발화 시점에 호출. 앞 20초를 즉시 고정한다. 명령이 신호보다 늦게 처리될 수 있으므로(음성 인식 지연, 버스 밀림)
+     * 이미 버퍼에 들어온 뒤 10초 구간도 함께 넣는다. 뒤 구간이 이미 다 있으면 바로 완성해 돌려주고, 아니면 pending으로 두고
+     * onEvent가 post 구간을 넘길 때 완성한다(그때는 null).
+     */
+    fun capture(triggerTs: Long): Capture? {
         val from = triggerTs - preNs
-        pending.add(Pending(triggerTs, temp.slice(from, triggerTs).toMutableList(), temp.baselineBefore(from)))
+        val frozen = temp.slice(from, triggerTs + postNs).toMutableList()
+        val baseline = temp.baselineBefore(from)
+        if ((temp.newestTs() ?: Long.MIN_VALUE) > triggerTs + postNs) return Capture(triggerTs, frozen, preNs, postNs, complete = true, baseline = baseline)
+        pending.add(Pending(triggerTs, frozen, baseline)); return null
     }
 
-    /** 정차 후 시점 선택. 임시 버퍼에 그 구간이 남아 있으면 즉시 완성. 없으면 null. */
+    /**
+     * 정차 후 시점 선택(또는 "느꼈어요"의 알림 시점). 임시 버퍼에 앞 20초가 남아 있으면 잘라낸다. 없으면 null.
+     * 뒤 10초가 아직 다 쌓이지 않았으면 있는 만큼만 넣고 complete=false.
+     */
     fun captureAt(ts: Long): Capture? {
         val oldest = temp.oldestTs() ?: return null
         val from = ts - preNs
         if (from < oldest) return null
-        return Capture(ts, temp.slice(from, ts + postNs), preNs, postNs, complete = true, baseline = temp.baselineBefore(from))
+        val complete = (temp.newestTs() ?: ts) >= ts + postNs
+        return Capture(ts, temp.slice(from, ts + postNs), preNs, postNs, complete = complete, baseline = temp.baselineBefore(from))
     }
 
     /** 정차·앱 종료 등으로 post 구간을 못 채울 때 지금까지로 마감. */
@@ -101,6 +113,12 @@ class CaptureService(
         pending.clear(); return out
     }
 
-    /** 임시 데이터 폐기 (정차 후 미선택, 재시작). */
-    fun discardTemp() { temp.clear(); pending.clear() }
+    /**
+     * 임시 데이터 폐기 (정차 후 미선택, 재시작). 임시 10분 버퍼만 버린다.
+     * 이미 "기록해"로 고정된 Capture는 정식 기록이므로 버리지 않고 지금까지로 마감해 돌려준다(complete=false).
+     */
+    fun discardTemp(): List<Capture> {
+        val out = pending.map { Capture(it.triggerTs, it.frozen.toList(), preNs, postNs, complete = false, baseline = it.baseline) }
+        temp.clear(); pending.clear(); return out
+    }
 }

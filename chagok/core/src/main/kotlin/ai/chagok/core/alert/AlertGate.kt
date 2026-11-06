@@ -26,9 +26,12 @@ class InMemoryAlertLedger : AlertLedger {
     override fun recordAlert(issueId: String, date: LocalDate) { counts[issueId to date] = alertCount(issueId, date) + 1 }
 }
 
+/** 거절 사유. Engine은 COOLDOWN·DAILY_CAP(이 문제가 "방금 울렸거나 오늘 다 울린" 경우)만 뒤 문제를 가리는 사유로 본다. */
+enum class DenyReason { PROFILE, USER_CHOICE, DRIVING, COOLDOWN, DAILY_CAP }
+
 sealed class Decision {
     data class Allow(val alertId: String) : Decision()
-    data class Deny(val reason: String) : Decision()
+    data class Deny(val reason: DenyReason) : Decision()
 }
 
 data class AlertCandidate(val issueId: String, val tsMonoNs: Long, val naviChecked: Boolean, val repairCheck: Boolean)
@@ -47,15 +50,15 @@ class AlertGate(
     private val lastAlertNs = HashMap<String, Long>()
 
     fun decide(c: AlertCandidate, p: ConditionProfile): Decision {
-        if (!p.alertsEnabled) return Decision.Deny("profile ${p.state}")
-        if (p.needsUserChoice) return Decision.Deny("needs user choice after 3 not-felt")
-        if (!drivingGate.alertsAllowed()) return Decision.Deny("driving restriction")
+        if (!p.alertsEnabled) return Decision.Deny(DenyReason.PROFILE)
+        if (p.needsUserChoice) return Decision.Deny(DenyReason.USER_CHOICE)
+        if (!drivingGate.alertsAllowed()) return Decision.Deny(DenyReason.DRIVING)
         // 내비 없이 판정한 후보는 문턱을 올린다: 쿨다운 2배
         val cooldown = if (c.naviChecked) policy.cooldownNs else policy.cooldownNs * 2
-        lastAlertNs[c.issueId]?.let { if (c.tsMonoNs - it < cooldown) return Decision.Deny("cooldown") }
+        lastAlertNs[c.issueId]?.let { if (c.tsMonoNs - it < cooldown) return Decision.Deny(DenyReason.COOLDOWN) }
         val d = today()
         val cap = if (p.state == ProfileState.REDUCED) policy.reducedDailyCap else policy.dailyCap
-        if (ledger.alertCount(c.issueId, d) >= cap) return Decision.Deny("daily cap")
+        if (ledger.alertCount(c.issueId, d) >= cap) return Decision.Deny(DenyReason.DAILY_CAP)
         ledger.recordAlert(c.issueId, d); lastAlertNs[c.issueId] = c.tsMonoNs
         return Decision.Allow("a${++seq}")   // 알림 id는 세션 안에서만 쓰인다(열린 알림 ↔ 답변 연결)
     }

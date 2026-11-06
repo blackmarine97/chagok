@@ -65,7 +65,7 @@ class EngineScenarioTest {
         advanceUntilIdle()
         assertTrue(drain(EngineEvent.Alert::class.java).isEmpty(), "1건 후보 상태에서는 자동 알림 없음")
         engine.onCommand(Command.ArmAlert(issueId, true))
-        run(Fx.drive(1100.0, 6.5, brakeAt = 1105.0, brakeFor = 2.1, steer = 2.0, g = NaviGuidance.STRAIGHT))
+        run(Fx.drive(1100.0, 7.0, brakeAt = 1105.0, brakeFor = 2.1, steer = 2.0, g = NaviGuidance.STRAIGHT))
         advanceUntilIdle()
         val alert1 = drain(EngineEvent.Alert::class.java).first()
         assertEquals(issueId, alert1.issueId)
@@ -84,25 +84,35 @@ class EngineScenarioTest {
         // 금요일: 자동 알림(켜지 않아도) → 회전 안내 중엔 알림 없음
         trip = "fri"; events.clear()
         engine.onCommand(Command.ArmAlert(issueId, false))
-        run(Fx.drive(2000.0, 10.0, brakeAt = 2005.0, brakeFor = 2.0, steer = 8.0, g = NaviGuidance.TURN_AHEAD))
+        run(Fx.drive(2000.0, 10.0, brakeAt = 2005.0, brakeFor = 2.5, steer = 8.0, g = NaviGuidance.TURN_AHEAD))
         advanceUntilIdle()
         assertTrue(drain(EngineEvent.Alert::class.java).isEmpty(), "안내 상황 유형이 다르면 알림 없음")
-        run(Fx.drive(2100.0, 10.0, brakeAt = 2105.0, brakeFor = 2.0, steer = 8.0, g = NaviGuidance.STRAIGHT))
+        run(Fx.drive(2100.0, 10.0, brakeAt = 2105.0, brakeFor = 2.5, steer = 8.0, g = NaviGuidance.STRAIGHT))
         advanceUntilIdle()
         val alert2 = drain(EngineEvent.Alert::class.java).first()
 
-        // 수리 후: 3회 연속 못 느낌 → 사용자 선택 요청 → REDUCE
+        // 수리 후: 알림마다 정차 후 답 → 3회 연속 못 느낌(미확인은 연속을 깨지 않음) → 사용자 선택 요청 → REDUCE
+        // 답은 열린 알림 id로만 할 수 있으므로 알림을 실제로 받아서 답한다.
         engine.markRepairCheck(issueId, true)
-        engine.onCommand(Command.Answer(issueId, alert2.alertId, Observation.NOT_FELT))
-        engine.onCommand(Command.Answer(issueId, "x", Observation.UNKNOWN))     // 미확인은 연속 카운트를 깨지 않음
-        engine.onCommand(Command.Answer(issueId, "y", Observation.NOT_FELT))
-        engine.onCommand(Command.Answer(issueId, "z", Observation.NOT_FELT))
+        engine.onCommand(Command.Answer(issueId, alert2.alertId, Observation.NOT_FELT, "junho"))
+        fun nextAlert(t0: Double): EngineEvent.Alert {
+            events.clear()
+            run(Fx.drive(t0, 10.0, brakeAt = t0 + 5.0, brakeFor = 2.5, steer = 8.0, g = NaviGuidance.STRAIGHT))
+            advanceUntilIdle()
+            return drain(EngineEvent.Alert::class.java).single()
+        }
+        val a3 = nextAlert(2200.0)
+        assertTrue(a3.repairCheck, "수리 후 확인 알림"); assertEquals(2, a3.recordCount)
+        engine.onCommand(Command.Answer(issueId, a3.alertId, Observation.UNKNOWN, "junho"))     // 미확인은 연속 카운트를 깨지 않음
+        engine.onCommand(Command.Answer(issueId, nextAlert(2300.0).alertId, Observation.NOT_FELT, "junho"))
+        engine.onCommand(Command.Answer(issueId, nextAlert(2400.0).alertId, Observation.NOT_FELT, "junho"))
         advanceUntilIdle()
-        assertTrue(drain(EngineEvent.UserChoiceNeeded::class.java).isNotEmpty())
+        val choice = drain(EngineEvent.UserChoiceNeeded::class.java).single()
+        assertTrue(choice.repairCheck, "수리 후 확인 중이면 '해결로 기록할까요'로 묻는다")
         val c = repo.profile(issueId)!!.counts
         assertEquals(3, c.notFelt); assertEquals(1, c.unknown); assertEquals(0, c.felt)
         events.clear()
-        run(Fx.drive(2200.0, 10.0, brakeAt = 2205.0, brakeFor = 2.0, steer = 8.0, g = NaviGuidance.STRAIGHT))
+        run(Fx.drive(2500.0, 10.0, brakeAt = 2505.0, brakeFor = 2.5, steer = 8.0, g = NaviGuidance.STRAIGHT))
         advanceUntilIdle()
         assertTrue(drain(EngineEvent.Alert::class.java).isEmpty(), "선택 전에는 알리지 않음")
         engine.onCommand(Command.AdjustAlert(issueId, AlertAdjustment.REDUCE))
